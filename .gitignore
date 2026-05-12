@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+.env.*
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
+coverage/
+deployment/screenshots/*.png
+deployment/screenshots/*.jpg
+deployment/screenshots/*.jpeg
+report/*.png
+report/*.jpg
+report/*.jpeg

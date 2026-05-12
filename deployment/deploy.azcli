@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================
+# Project variables (EDIT)
+# =========================
+LOCATION="southeastasia"
+RG="rg-csec3-cloudcom"
+
+APP_PLAN="asp-cloudcom"
+WEBAPP="app-cloudcom-$RANDOM$RANDOM"
+
+STORAGE="stcloudcom$RANDOM$RANDOM"
+CONTAINER="products"
+
+SQL_SERVER="sql-cloudcom-$RANDOM$RANDOM"
+SQL_DB="sqldb-cloudcom"
+SQL_ADMIN_USER="sqladminuser"
+
+# IMPORTANT:
+# Do NOT hardcode passwords in this repo.
+# Provide SQL admin password via environment variable when running:
+#   export SQL_ADMIN_PASSWORD='...'
+SQL_ADMIN_PASSWORD="${SQL_ADMIN_PASSWORD:-}"
+if [[ -z "$SQL_ADMIN_PASSWORD" ]]; then
+  echo "ERROR: SQL_ADMIN_PASSWORD env var not set."
+  echo "Set it (temporarily) in your shell before running."
+  exit 1
+fi
+
+# Optional improvements
+ENABLE_APPINSIGHTS="true"
+ENABLE_KEYVAULT="true"
+KEYVAULT="kv-cloudcom-$RANDOM$RANDOM"
+
+# Optional (Scenario B): Azure Cache for Redis
+ENABLE_REDIS="true"
+REDIS_NAME="redis-cloudcom-$RANDOM$RANDOM"
+
+echo "Deploying to:"
+echo "  RG=$RG"
+echo "  LOCATION=$LOCATION"
+echo "  WEBAPP=$WEBAPP"
+echo "  SQL_SERVER=$SQL_SERVER"
+echo "  STORAGE=$STORAGE"
+echo "  REDIS_ENABLED=$ENABLE_REDIS"
+echo
+
+az group create -n "$RG" -l "$LOCATION" 1>/dev/null
+
+# -------------------------
+# Storage (Blob)
+# -------------------------
+az storage account create \
+  -n "$STORAGE" \
+  -g "$RG" \
+  -l "$LOCATION" \
+  --sku Standard_LRS \
+  --kind StorageV2 \
+  1>/dev/null
+
+STORAGE_KEY="$(az storage account keys list -g "$RG" -n "$STORAGE" --query "[0].value" -o tsv)"
+
+az storage container create \
+  --name "$CONTAINER" \
+  --account-name "$STORAGE" \
+  --account-key "$STORAGE_KEY" \
+  1>/dev/null
+
+# -------------------------
+# SQL (Server + DB)
+# -------------------------
+az sql server create \
+  -g "$RG" \
+  -n "$SQL_SERVER" \
+  -l "$LOCATION" \
+  -u "$SQL_ADMIN_USER" \
+  -p "$SQL_ADMIN_PASSWORD" \
+  1>/dev/null
+
+# Allow Azure services to access SQL (demo-friendly baseline)
+az sql server firewall-rule create \
+  -g "$RG" \
+  -s "$SQL_SERVER" \
+  -n "AllowAzureServices" \
+  --start-ip-address 0.0.0.0 \
+  --end-ip-address 0.0.0.0 \
+  1>/dev/null
+
+az sql db create \
+  -g "$RG" \
+  -s "$SQL_SERVER" \
+  -n "$SQL_DB" \
+  --service-objective S0 \
+  1>/dev/null
+
+SQL_FQDN="$(az sql server show -g "$RG" -n "$SQL_SERVER" --query fullyQualifiedDomainName -o tsv)"
+
+# -------------------------
+# App Service (Plan + Web App)
+# -------------------------
+az appservice plan create \
+  -g "$RG" \
+  -n "$APP_PLAN" \
+  --is-linux \
+  --sku B1 \
+  1>/dev/null
+
+# Ensure 2 instances (course requirement)
+az appservice plan update \
+  -g "$RG" \
+  -n "$APP_PLAN" \
+  --number-of-workers 2 \
+  1>/dev/null
+
+# Node runtime for starter app
+az webapp create \
+  -g "$RG" \
+  -p "$APP_PLAN" \
+  -n "$WEBAPP" \
+  --runtime "NODE:20-lts" \
+  1>/dev/null
+
+# Managed Identity (security improvement)
+az webapp identity assign -g "$RG" -n "$WEBAPP" 1>/dev/null
+
+# Basic app settings (DB + storage)
+az webapp config appsettings set \
+  -g "$RG" \
+  -n "$WEBAPP" \
+  --settings \
+    "SQL_SERVER=$SQL_FQDN" \
+    "SQL_DATABASE=$SQL_DB" \
+    "SQL_USER=$SQL_ADMIN_USER" \
+    "SQL_PASSWORD=$SQL_ADMIN_PASSWORD" \
+    "STORAGE_ACCOUNT=$STORAGE" \
+    "STORAGE_CONTAINER=$CONTAINER" \
+    "STORAGE_KEY=$STORAGE_KEY" \
+  1>/dev/null
+
+# -------------------------
+# Azure Cache for Redis (optional - performance improvement)
+# -------------------------
+if [[ "$ENABLE_REDIS" == "true" ]]; then
+  # Basic C0 cache is usually enough for demo (adjust if needed)
+  az redis create \
+    -g "$RG" \
+    -n "$REDIS_NAME" \
+    -l "$LOCATION" \
+    --sku Basic \
+    --vm-size c0 \
+    1>/dev/null
+
+  REDIS_HOST="$(az redis show -g "$RG" -n "$REDIS_NAME" --query hostName -o tsv)"
+  REDIS_KEY="$(az redis list-keys -g "$RG" -n "$REDIS_NAME" --query primaryKey -o tsv)"
+
+  az webapp config appsettings set \
+    -g "$RG" \
+    -n "$WEBAPP" \
+    --settings \
+      "REDIS_HOST=$REDIS_HOST" \
+      "REDIS_KEY=$REDIS_KEY" \
+      "REDIS_PORT=6380" \
+      "REDIS_TLS=true" \
+    1>/dev/null
+fi
+
+# -------------------------
+# Autoscale (scalability improvement)
+# -------------------------
+# Simple CPU-based autoscale profile (min 2, max 3)
+PLAN_ID="$(az appservice plan show -g "$RG" -n "$APP_PLAN" --query id -o tsv)"
+az monitor autoscale create \
+  -g "$RG" \
+  --resource "$PLAN_ID" \
+  --resource-type "Microsoft.Web/serverfarms" \
+  -n "as-$APP_PLAN" \
+  --min-count 2 \
+  --max-count 3 \
+  --count 2 \
+  1>/dev/null
+
+az monitor autoscale rule create \
+  -g "$RG" \
+  --autoscale-name "as-$APP_PLAN" \
+  --condition "Percentage CPU > 70 avg 5m" \
+  --scale out 1 \
+  1>/dev/null
+
+az monitor autoscale rule create \
+  -g "$RG" \
+  --autoscale-name "as-$APP_PLAN" \
+  --condition "Percentage CPU < 30 avg 10m" \
+  --scale in 1 \
+  1>/dev/null
+
+# -------------------------
+# Application Insights (monitoring improvement)
+# -------------------------
+if [[ "$ENABLE_APPINSIGHTS" == "true" ]]; then
+  # Requires the application-insights extension in some environments; CLI will prompt if missing.
+  az monitor app-insights component create \
+    -g "$RG" \
+    -a "appi-$WEBAPP" \
+    -l "$LOCATION" \
+    --application-type web \
+    1>/dev/null
+
+  APPINSIGHTS_KEY="$(az monitor app-insights component show -g "$RG" -a "appi-$WEBAPP" --query instrumentationKey -o tsv)"
+  az webapp config appsettings set \
+    -g "$RG" \
+    -n "$WEBAPP" \
+    --settings "APPINSIGHTS_INSTRUMENTATIONKEY=$APPINSIGHTS_KEY" \
+    1>/dev/null
+fi
+
+# -------------------------
+# Key Vault (security improvement - optional)
+# -------------------------
+if [[ "$ENABLE_KEYVAULT" == "true" ]]; then
+  az keyvault create \
+    -g "$RG" \
+    -n "$KEYVAULT" \
+    -l "$LOCATION" \
+    1>/dev/null
+
+  # Store secrets for demo (then update your app to use KV references if desired)
+  az keyvault secret set --vault-name "$KEYVAULT" -n "SqlAdminPassword" --value "$SQL_ADMIN_PASSWORD" 1>/dev/null
+  az keyvault secret set --vault-name "$KEYVAULT" -n "StorageKey" --value "$STORAGE_KEY" 1>/dev/null
+
+  echo "Key Vault created: $KEYVAULT"
+  echo "Next improvement step: replace app settings with Key Vault references."
+fi
+
+APP_URL="https://$WEBAPP.azurewebsites.net"
+
+echo
+echo "DONE."
+echo "Web App URL: $APP_URL"
+echo "Resource Group: $RG"
