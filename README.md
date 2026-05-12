@@ -1,7 +1,7 @@
 # CSEC 3 Final Project — Cloud Web Application Deployment on Azure
 
 ## Scenario
-**B — E-Commerce Storefront**: a simple product catalog with browsing and cart functionality (no real payment processing).
+**E-Commerce Storefront**: a simple product catalog with browsing and cart functionality (no real payment processing).
 
 ## Team
 - JAVE A. BACSAIN
